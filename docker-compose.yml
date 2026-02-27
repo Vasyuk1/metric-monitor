@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  core:
+    build: ./core
+    ports:
+      - "8000:8000"
+    volumes:
+      - core-data:/app
+    networks:
+      - monitor-net
+
+  agent:
+    build: ./agent
+    depends_on:
+      - core
+    environment:
+      - SERVER_URL=http://core:8000/api/v1/metrics
+    networks:
+      - monitor-net
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - /mnt/d/Diplom/metric-monitor/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    networks:
+      - monitor-net
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - monitor-net
+
+networks:
+  monitor-net:
+    driver: bridge
+
+volumes:
+  core-data:
+  prometheus-data:
+  grafana-data:
