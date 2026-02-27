@@ -25,6 +25,7 @@ async def receive_metrics(payload: MetricPayload):
     ts = payload.timestamp or int(time.time())
     for name, value in payload.metrics.items():
         # Сохраняем в БД
+        print(f"🔵 Updating {name} = {value}")
         save_metric(payload.agent_id, ts, name, value, payload.tags)
         # Обновляем Prometheus-реестр
         registry.set_gauge(name, value, {**payload.tags, "agent": payload.agent_id})
