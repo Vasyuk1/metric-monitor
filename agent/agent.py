@@ -1,23 +1,30 @@
 import psutil
 import requests
 import time
-import socket
+import logging
 from datetime import datetime
+from typing import Dict, List, Any
 
-# Конфигурация
-CONFIG = {
-    "agent_id": socket.gethostname(),
-    "server_url": "http://localhost:8000/api/v1/metrics",  # при Docker заменим на http://core:8000
-    "interval": 5,
-    "tags": {
-        "hostname": socket.gethostname(),
-        "ip": socket.gethostbyname(socket.gethostname()),
-        "os": "windows"
-    }
-}
+from settings import settings
 
-def collect_metrics():
-    """Сбор системных метрик через psutil."""
+# Настройка логирования
+logging.basicConfig(
+    filename=settings.LOG_FILE,
+    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    format='%(asctime)s %(levelname)s:%(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+# Дублирование в консоль
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s', datefmt='%H:%M:%S')
+console.setFormatter(formatter)
+logging.getLogger('').addHandler(console)
+
+logger = logging.getLogger(__name__)
+
+def collect_metrics() -> Dict[str, float]:
+    """Сбор системных метрик."""
     metrics = {
         "cpu_usage": psutil.cpu_percent(interval=1),
         "memory_usage": psutil.virtual_memory().percent,
@@ -27,27 +34,64 @@ def collect_metrics():
         "process_count": len(psutil.pids()),
         "uptime": time.time() - psutil.boot_time()
     }
+    metrics.update(settings.CUSTOM_METRICS)
     return metrics
 
-def send_metrics():
-    metrics = collect_metrics()
+def build_payload(metrics: Dict[str, float], batch: List[Dict[str, Any]]) -> None:
+    """Добавляет метрики в текущий батч."""
     payload = {
-        "agent_id": CONFIG["agent_id"],
+        "agent_id": settings.AGENT_ID,
         "timestamp": int(time.time()),
         "metrics": metrics,
-        "tags": CONFIG["tags"]
+        "tags": settings.TAGS.copy()
     }
+    payload["tags"]["version"] = settings.VERSION
+    batch.append(payload)
+
+def send_batch(batch: List[Dict[str, Any]]) -> None:
+    """Отправляет накопленный батч на сервер."""
+    if not batch:
+        return
     try:
-        response = requests.post(CONFIG["server_url"], json=payload, timeout=2)
+        response = requests.post(
+            settings.SERVER_URL,
+            json={"batch": batch},
+            timeout=5
+        )
         if response.status_code == 200:
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Sent {len(metrics)} metrics")
+            total_metrics = sum(len(p['metrics']) for p in batch)
+            logger.info(f"Sent batch of {len(batch)} payloads, {total_metrics} metrics")
+        elif response.status_code >= 500:
+            logger.error(f"Server error {response.status_code}: {response.text}")
         else:
-            print(f"Server error: {response.status_code}")
+            logger.warning(f"Unexpected response {response.status_code}: {response.text}")
+    except requests.exceptions.ConnectionError:
+        logger.error("Connection error: server unreachable")
     except Exception as e:
-        print(f"Connection error: {e}")
+        logger.exception(f"Unexpected error sending batch: {e}")
+
+def main():
+    logger.info(f"Agent {settings.AGENT_ID} started. Sending to {settings.SERVER_URL} every {settings.INTERVAL}s")
+    batch = []
+    last_send = time.time()
+    
+    while True:
+        try:
+            metrics = collect_metrics()
+            build_payload(metrics, batch)
+            
+            if len(batch) >= settings.BATCH_SIZE or (time.time() - last_send) >= settings.INTERVAL:
+                send_batch(batch)
+                batch.clear()
+                last_send = time.time()
+            
+            time.sleep(1)
+        except KeyboardInterrupt:
+            logger.info("Agent stopped by user")
+            break
+        except Exception as e:
+            logger.exception("Unhandled error in main loop")
+            time.sleep(5)
 
 if __name__ == "__main__":
-    print(f"Agent {CONFIG['agent_id']} started, sending to {CONFIG['server_url']}")
-    while True:
-        send_metrics()
-        time.sleep(CONFIG["interval"])
+    main()
