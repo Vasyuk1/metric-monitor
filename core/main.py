@@ -12,7 +12,7 @@ from registry import registry
 from database import init_db, get_db, save_metric
 from models import MetricPayload, MetricsBatch
 
-# Настройка логирования будет производиться в функции main
+# Настройка логирования будет произведена в main()
 logger = logging.getLogger(__name__)
 
 def create_app():
@@ -40,7 +40,6 @@ def create_app():
 
         for payload in batch.batch:
             ts = payload.timestamp or int(time.time())
-            # Обновление информации об агенте
             if payload.agent_id not in agent_updates:
                 agent_updates[payload.agent_id] = {
                     "hostname": payload.tags.get("hostname") if payload.tags else None,
@@ -134,6 +133,9 @@ def create_app():
 
     return app
 
+# Глобальный экземпляр app (нужен для uvicorn)
+app = create_app()
+
 @click.command()
 @click.option('--host', default='0.0.0.0', help='Host to bind')
 @click.option('--port', default=8000, help='Port to bind')
@@ -152,8 +154,6 @@ def main(host, port, log_file, log_level):
     )
     global logger
     logger = logging.getLogger(__name__)
-
-    app = create_app()
     logger.info(f"Starting core on {host}:{port}")
     uvicorn.run(app, host=host, port=port)
 
