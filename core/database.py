@@ -1,75 +1,82 @@
-import sqlite3
+import os
 import json
-from contextlib import contextmanager
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy import Column, Integer, String, Float, Text, Index, select, text
 
-DATABASE = "metrics.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://metrics:metrics@postgres/metrics")
 
-def init_db():
-    with sqlite3.connect(DATABASE) as conn:
-        cursor = conn.cursor()
-        cursor.executescript("""
-            CREATE TABLE IF NOT EXISTS agents (
-                agent_id TEXT PRIMARY KEY,
-                hostname TEXT,
-                ip TEXT,
-                first_seen INTEGER NOT NULL,
-                last_seen INTEGER NOT NULL,
-                tags TEXT
-            );
-            
-            CREATE TABLE IF NOT EXISTS metrics (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                value REAL NOT NULL,
-                timestamp INTEGER NOT NULL,
-                tags TEXT,
-                FOREIGN KEY (agent_id) REFERENCES agents(agent_id)
-            );
-            
-            CREATE INDEX IF NOT EXISTS idx_metrics_agent_time ON metrics(agent_id, timestamp);
-            CREATE INDEX IF NOT EXISTS idx_metrics_name_time ON metrics(name, timestamp);
-            
-            CREATE VIEW IF NOT EXISTS latest_metrics AS
-            SELECT m.agent_id, m.name, m.value, m.timestamp
-            FROM metrics m
-            INNER JOIN (
-                SELECT agent_id, name, MAX(timestamp) as max_ts
-                FROM metrics
-                GROUP BY agent_id, name
-            ) latest ON m.agent_id = latest.agent_id AND m.name = latest.name AND m.timestamp = latest.max_ts;
-        """)
-        conn.commit()
+engine = create_async_engine(DATABASE_URL, echo=True)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-@contextmanager
-def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
+Base = declarative_base()
 
-def save_metric(agent_id: str, timestamp: int, name: str, value: float, tags: dict = None):
-    with get_db() as conn:
-        cursor = conn.cursor()
-        # Обновить информацию об агенте
-        cursor.execute("""
-            INSERT INTO agents (agent_id, hostname, ip, first_seen, last_seen, tags)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(agent_id) DO UPDATE SET
-                last_seen = excluded.last_seen,
-                hostname = excluded.hostname,
-                ip = excluded.ip,
-                tags = excluded.tags
-        """, (agent_id, 
-              tags.get('hostname') if tags else None,
-              tags.get('ip') if tags else None,
-              timestamp, timestamp, 
-              json.dumps(tags) if tags else None))
-        # Сохранить метрику
-        cursor.execute("""
-            INSERT INTO metrics (agent_id, name, value, timestamp, tags)
-            VALUES (?, ?, ?, ?, ?)
-        """, (agent_id, name, value, timestamp, json.dumps(tags) if tags else None))
-        conn.commit()
+class Agent(Base):
+    __tablename__ = 'agents'
+    agent_id = Column(String, primary_key=True)
+    hostname = Column(String, nullable=True)
+    ip = Column(String, nullable=True)
+    port = Column(Integer, nullable=True)
+    first_seen = Column(Integer, nullable=False)
+    last_seen = Column(Integer, nullable=False)
+    tags = Column(Text)  # JSON
+    version = Column(String, nullable=True)
+
+class Metric(Base):
+    __tablename__ = 'metrics'
+    id = Column(Integer, primary_key=True)
+    agent_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False, index=True)
+    value = Column(Float, nullable=False)
+    timestamp = Column(Integer, nullable=False, index=True)
+    tags = Column(Text)  # JSON
+
+    __table_args__ = (
+        Index('idx_agent_time', 'agent_id', 'timestamp'),
+        Index('idx_name_time', 'name', 'timestamp'),
+    )
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+async def save_metric(agent_id: str, timestamp: int, name: str, value: float, tags: dict = None):
+    async with AsyncSessionLocal() as session:
+        # Проверяем, существует ли агент
+        stmt = select(Agent).where(Agent.agent_id == agent_id)
+        result = await session.execute(stmt)
+        agent = result.scalar_one_or_none()
+        if agent is None:
+            agent = Agent(
+                agent_id=agent_id,
+                first_seen=timestamp,
+                last_seen=timestamp,
+                tags=json.dumps(tags) if tags else None
+            )
+            session.add(agent)
+        else:
+            agent.last_seen = timestamp
+            # Обновляем поля, если они переданы в tags
+            if tags:
+                if 'hostname' in tags:
+                    agent.hostname = tags['hostname']
+                if 'ip' in tags:
+                    agent.ip = tags['ip']
+                if 'version' in tags:
+                    agent.version = tags['version']
+                # Обновляем tags (последние теги)
+                agent.tags = json.dumps(tags)
+
+        metric = Metric(
+            agent_id=agent_id,
+            name=name,
+            value=value,
+            timestamp=timestamp,
+            tags=json.dumps(tags) if tags else None
+        )
+        session.add(metric)
+        await session.commit()
