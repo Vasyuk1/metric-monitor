@@ -1,31 +1,25 @@
 -- Схема базы данных для системы сбора метрик
--- Версия: 1.0
-
-PRAGMA foreign_keys = ON;  -- обязательно включить поддержку внешних ключей
 
 -- Таблица агентов (источников метрик)
 CREATE TABLE agents (
-    agent_id TEXT PRIMARY KEY,        -- уникальный идентификатор агента (например, hostname)
-    hostname TEXT,                    -- имя хоста
-    ip TEXT,                          -- IP-адрес (если известен)
-    port INTEGER,                     -- порт для управления (если агент слушает)
-    first_seen INTEGER NOT NULL,      -- timestamp первого появления
-    last_seen INTEGER NOT NULL,       -- timestamp последней активности
-    tags TEXT,                        -- JSON с дополнительными метками агента
-                                      -- пример: {"os":"windows","environment":"prod","region":"ru"}
-    version TEXT                       -- версия протокола агента
+    agent_id TEXT PRIMARY KEY,
+    hostname TEXT,
+    ip TEXT,
+    port INTEGER,
+    first_seen INTEGER NOT NULL,
+    last_seen INTEGER NOT NULL,
+    tags TEXT,  -- JSON: дополнительные метки агента 
+    version TEXT
 );
 
 -- Таблица метрик (временные ряды)
 CREATE TABLE metrics (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    agent_id TEXT NOT NULL,            -- ссылка на агента
-    name TEXT NOT NULL,                -- имя метрики (рекомендуется иерархический формат)
-                                       -- пример: "system/cpu/usage", "app/requests/count"
-    value REAL NOT NULL,               -- числовое значение
-    timestamp INTEGER NOT NULL,        -- время сбора (Unix timestamp)
-    tags TEXT,                         -- JSON с метками, специфичными для данной метрики
-                                       -- пример: {"disk":"C:","mount":"/"}
+    id SERIAL PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    name TEXT NOT NULL, 
+    value REAL NOT NULL,
+    timestamp INTEGER NOT NULL,
+    tags TEXT,  -- JSON: метки конкретной метрики (например, {"disk":"C:"})
     FOREIGN KEY (agent_id) REFERENCES agents(agent_id) ON DELETE CASCADE
 );
 
@@ -33,7 +27,7 @@ CREATE TABLE metrics (
 CREATE INDEX idx_metrics_agent_time ON metrics(agent_id, timestamp);
 CREATE INDEX idx_metrics_name_time ON metrics(name, timestamp);
 
--- Представление для последних значений метрик (для Prometheus-подобных запросов)
+-- Представление для последних значений метрик (для Prometheus)
 CREATE VIEW latest_metrics AS
 SELECT m.agent_id, m.name, m.value, m.timestamp
 FROM metrics m
