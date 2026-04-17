@@ -1,13 +1,12 @@
 import os
 import json
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, Index
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, Integer, String, Float, Text, Index, select, text
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://metrics:metrics@postgres/metrics")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://metrics:metrics@postgres/metrics")
 
-engine = create_async_engine(DATABASE_URL, echo=True)
-AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+engine = create_engine(DATABASE_URL, echo=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
@@ -19,7 +18,7 @@ class Agent(Base):
     port = Column(Integer, nullable=True)
     first_seen = Column(Integer, nullable=False)
     last_seen = Column(Integer, nullable=False)
-    tags = Column(Text)  # JSON
+    tags = Column(Text)
     version = Column(String, nullable=True)
 
 class Metric(Base):
@@ -29,27 +28,35 @@ class Metric(Base):
     name = Column(String, nullable=False, index=True)
     value = Column(Float, nullable=False)
     timestamp = Column(Integer, nullable=False, index=True)
-    tags = Column(Text)  # JSON
+    tags = Column(Text)
 
     __table_args__ = (
         Index('idx_agent_time', 'agent_id', 'timestamp'),
         Index('idx_name_time', 'name', 'timestamp'),
     )
 
-async def init_db():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    login = Column(String, unique=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    role = Column(String, nullable=False, default='user')
+    created_at = Column(Integer, nullable=False)
 
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
+def init_db():
+    Base.metadata.create_all(bind=engine)
 
-async def save_metric(agent_id: str, timestamp: int, name: str, value: float, tags: dict = None):
-    async with AsyncSessionLocal() as session:
-        # Проверяем, существует ли агент
-        stmt = select(Agent).where(Agent.agent_id == agent_id)
-        result = await session.execute(stmt)
-        agent = result.scalar_one_or_none()
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+def save_metric(agent_id: str, timestamp: int, name: str, value: float, tags: dict = None):
+    db = SessionLocal()
+    try:
+        agent = db.query(Agent).filter(Agent.agent_id == agent_id).first()
         if agent is None:
             agent = Agent(
                 agent_id=agent_id,
@@ -57,10 +64,9 @@ async def save_metric(agent_id: str, timestamp: int, name: str, value: float, ta
                 last_seen=timestamp,
                 tags=json.dumps(tags) if tags else None
             )
-            session.add(agent)
+            db.add(agent)
         else:
             agent.last_seen = timestamp
-            # Обновляем поля, если они переданы в tags
             if tags:
                 if 'hostname' in tags:
                     agent.hostname = tags['hostname']
@@ -68,9 +74,7 @@ async def save_metric(agent_id: str, timestamp: int, name: str, value: float, ta
                     agent.ip = tags['ip']
                 if 'version' in tags:
                     agent.version = tags['version']
-                # Обновляем tags (последние теги)
                 agent.tags = json.dumps(tags)
-
         metric = Metric(
             agent_id=agent_id,
             name=name,
@@ -78,5 +82,7 @@ async def save_metric(agent_id: str, timestamp: int, name: str, value: float, ta
             timestamp=timestamp,
             tags=json.dumps(tags) if tags else None
         )
-        session.add(metric)
-        await session.commit()
+        db.add(metric)
+        db.commit()
+    finally:
+        db.close()

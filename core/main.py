@@ -1,17 +1,17 @@
 import time
 import json
 import logging
+import os
 import click
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from fastapi.responses import Response
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 import uvicorn
-from datetime import datetime
 
 from registry import registry
-from database import init_db, save_metric, AsyncSessionLocal, Agent, Metric
-from models import MetricPayload, MetricsBatch
-from sqlalchemy import select
+from database import init_db, get_db, save_metric, Metric, Agent, User
+from models import MetricPayload, MetricsBatch, LoginRequest
+from auth import verify_password, get_password_hash, create_access_token, get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -19,26 +19,105 @@ def create_app():
     app = FastAPI(title="Metrics Collector Core")
 
     @app.on_event("startup")
-    async def startup():
-        await init_db()
+    def startup():
+        init_db()
+        # Создание администратора по умолчанию
+        db = next(get_db())
+        admin = db.query(User).filter(User.login == "admin").first()
+        if not admin:
+            admin_pass = os.getenv("ADMIN_PASSWORD", "admin")
+            hashed = get_password_hash(admin_pass)
+            admin = User(login="admin", password_hash=hashed, role="admin", created_at=int(time.time()))
+            db.add(admin)
+            db.commit()
+            print(f"Default admin created (login: admin, password: {admin_pass})")
+        db.close()
         logger.info("Core started, database initialized.")
 
+    # --- Эндпоинты авторизации ---
+    @app.post("/api/auth/register")
+    def register(req: LoginRequest, db=Depends(get_db)):
+        existing = db.query(User).filter(User.login == req.login).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Login already exists")
+        hashed = get_password_hash(req.password)
+        user = User(login=req.login, password_hash=hashed, role="user", created_at=int(time.time()))
+        db.add(user)
+        db.commit()
+        return {"msg": "User created"}
+
+    @app.post("/api/auth/login")
+    def login(req: LoginRequest, db=Depends(get_db)):
+        user = db.query(User).filter(User.login == req.login).first()
+        if not user or not verify_password(req.password, user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+        access_token = create_access_token(data={"sub": user.login, "role": user.role})
+        return {"access_token": access_token, "token_type": "bearer", "role": user.role, "login": user.login}
+
+    @app.get("/api/auth/me")
+    def get_me(current_user: User = Depends(get_current_user)):
+        return {"login": current_user.login, "role": current_user.role}
+
+    # --- Защищённый эндпоинт для получения метрик ---
+    @app.get("/api/v1/metrics/query")
+    def query_metrics(
+        limit: int = 100,
+        offset: int = 0,
+        sort: str = "desc",
+        agent: str = None,
+        metric_name: str = None,
+        from_time: int = None,
+        to_time: int = None,
+        current_user: User = Depends(get_current_user),
+        db=Depends(get_db)
+    ):
+        query = db.query(Metric)
+        if agent:
+            query = query.filter(Metric.agent_id == agent)
+        if metric_name:
+            query = query.filter(Metric.name == metric_name)
+        if from_time:
+            query = query.filter(Metric.timestamp >= from_time)
+        if to_time:
+            query = query.filter(Metric.timestamp <= to_time)
+        if sort == "desc":
+            query = query.order_by(Metric.timestamp.desc())
+        else:
+            query = query.order_by(Metric.timestamp.asc())
+        total = query.count()
+        metrics = query.offset(offset).limit(limit).all()
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "metrics": [
+                {
+                    "agent_id": m.agent_id,
+                    "name": m.name,
+                    "value": m.value,
+                    "timestamp": m.timestamp,
+                    "tags": json.loads(m.tags) if m.tags else {}
+                } for m in metrics
+            ]
+        }
+
+    # --- Эндпоинты приёма метрик (открытые) ---
     @app.post("/api/v1/metrics")
-    async def receive_metrics(payload: MetricPayload):
+    def receive_metrics(payload: MetricPayload):
         ts = payload.timestamp
         for name, value in payload.metrics.items():
-            await save_metric(payload.agent_id, ts, name, value, payload.tags)
+            save_metric(payload.agent_id, ts, name, value, payload.tags)
             registry.set_gauge(name, value, {**payload.tags, "agent": payload.agent_id})
         logger.info(f"Received {len(payload.metrics)} metrics from {payload.agent_id}")
         return {"status": "ok", "received": len(payload.metrics)}
 
     @app.post("/api/v1/metrics/batch")
-    async def receive_metrics_batch(batch: MetricsBatch):
+    def receive_metrics_batch(batch: MetricsBatch):
         total = 0
         for payload in batch.batch:
             ts = payload.timestamp
             for name, value in payload.metrics.items():
-                await save_metric(payload.agent_id, ts, name, value, payload.tags)
+                save_metric(payload.agent_id, ts, name, value, payload.tags)
                 registry.set_gauge(name, value, {**payload.tags, "agent": payload.agent_id})
                 total += 1
         logger.info(f"Received batch with {len(batch.batch)} payloads, total {total} metrics")
@@ -55,7 +134,7 @@ def create_app():
                     payload = MetricPayload(**payload_data)
                     ts = payload.timestamp
                     for name, value in payload.metrics.items():
-                        await save_metric(payload.agent_id, ts, name, value, payload.tags)
+                        save_metric(payload.agent_id, ts, name, value, payload.tags)
                         registry.set_gauge(name, value, {**payload.tags, "agent": payload.agent_id})
                     await websocket.send_text("ok")
                 except Exception as e:
@@ -64,33 +143,24 @@ def create_app():
             logger.info("WebSocket disconnected")
 
     @app.get("/metrics")
-    async def prometheus_metrics():
+    def prometheus_metrics():
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/api/v1/agents")
-    async def list_agents():
-        async with AsyncSessionLocal() as session:
-            result = await session.execute(
-                select(Agent.agent_id, Agent.last_seen, Agent.hostname, Agent.ip)
-                .order_by(Agent.last_seen.desc())
-            )
-            rows = result.all()
-            return [{"agent_id": r[0], "last_seen": r[1], "hostname": r[2], "ip": r[3]} for r in rows]
+    def list_agents(db=Depends(get_db)):
+        agents = db.query(Agent).order_by(Agent.last_seen.desc()).all()
+        return [{"agent_id": a.agent_id, "last_seen": a.last_seen, "hostname": a.hostname, "ip": a.ip} for a in agents]
 
     @app.get("/api/v1/history")
-    async def get_history(metric: str, from_ts: int = None, to_ts: int = None, limit: int = 1000):
-        async with AsyncSessionLocal() as session:
-            query = select(Metric.agent_id, Metric.timestamp, Metric.value, Metric.tags) \
-                .where(Metric.name == metric)
-            if from_ts:
-                query = query.where(Metric.timestamp >= from_ts)
-            if to_ts:
-                query = query.where(Metric.timestamp <= to_ts)
-            query = query.order_by(Metric.timestamp.desc()).limit(limit)
-            result = await session.execute(query)
-            rows = result.all()
-            return [{"agent_id": r[0], "timestamp": r[1], "value": r[2],
-                     "tags": json.loads(r[3]) if r[3] else {}} for r in rows]
+    def get_history(metric: str, from_ts: int = None, to_ts: int = None, limit: int = 1000, db=Depends(get_db)):
+        query = db.query(Metric).filter(Metric.name == metric)
+        if from_ts:
+            query = query.filter(Metric.timestamp >= from_ts)
+        if to_ts:
+            query = query.filter(Metric.timestamp <= to_ts)
+        rows = query.order_by(Metric.timestamp.desc()).limit(limit).all()
+        return [{"agent_id": r.agent_id, "timestamp": r.timestamp, "value": r.value,
+                 "tags": json.loads(r.tags) if r.tags else {}} for r in rows]
 
     return app
 

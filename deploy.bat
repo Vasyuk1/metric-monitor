@@ -47,6 +47,13 @@ if errorlevel 1 (
 )
 cd ..
 
+REM Установка зависимостей для клиента (metrics_cli.py)
+echo Установка зависимостей для клиента...
+%PYTHON_CMD% -m pip install requests tabulate matplotlib > nul 2>&1
+if errorlevel 1 (
+    echo [WARNING] Ошибка при установке зависимостей клиента, возможно, они уже есть.
+)
+
 REM Запуск Docker-стека (PostgreSQL, core, Prometheus, Grafana)
 echo Запуск PostgreSQL, core, Prometheus, Grafana...
 docker-compose up -d postgres core prometheus grafana
@@ -63,14 +70,13 @@ REM Запуск агента в отдельном окне
 echo Запуск агента...
 start "Agent" cmd /c "cd agent && %PYTHON_CMD% agent.py"
 
+REM Запуск интерактивного клиента в текущем окне
 echo.
 echo ========================================
-echo   Система запущена!
+echo   Запуск интерактивного клиента...
 echo ========================================
+%PYTHON_CMD% metrics_cli.py
+
 echo.
-echo Core API: http://localhost:8000/docs
-echo Prometheus: http://localhost:9090
-echo Grafana: http://localhost:3000 (admin/admin)
-echo.
-echo Агент работает в отдельном окне. Не закрывайте его.
-pause
+echo Работа клиента завершена. Для выхода нажмите любую клавишу...
+pause > nul
